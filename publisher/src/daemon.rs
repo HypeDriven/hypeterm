@@ -154,8 +154,15 @@ pub async fn serve(
         // `hosting` as well as `clients`: a child spawned for a phone has not connected
         // back yet, so it does not count as a client, and standing down here would
         // unlink the socket it is about to attach to. It presents as a network fault.
+        //
+        // Remote open pins the daemon up entirely. The relay delivers an open request
+        // over the publisher connection this process owns, so a machine that has stood
+        // down cannot be asked for a terminal — and a machine with no terminal open is
+        // exactly when someone asks. Standing down would mean the phone could only ask
+        // for a second terminal, never a first, which is not a feature.
         let idle = shared.clients.load(Ordering::Acquire) == 0
-            && shared.hosting.load(Ordering::Acquire) == 0;
+            && shared.hosting.load(Ordering::Acquire) == 0
+            && !shared.remote.enabled;
         let deadline = idle.then(|| tokio::time::Instant::now() + IDLE_GRACE);
 
         tokio::select! {
