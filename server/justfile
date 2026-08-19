@@ -1,0 +1,488 @@
+# Terminal Mirror Relay — build, deploy and operate.
+#
+#   just up            deploy the latest container (local mode, loopback only)
+#   just up tailscale  deploy onto your tailnet, reachable only by your devices
+#   just up proxy      deploy behind a TLS-terminating reverse proxy
+#   just up tls        deploy with TLS terminated in-process
+#
+# Behaviour lives in the database, not in this file. `just up` applies only the few
+# settings that define the deployment's transport posture; everything else is tuned at
+# runtime with `just set name=value` or PATCH /v1/admin/settings.
+#
+# The chosen mode and ports are remembered in deploy/.env, so a later `just up`
+# redeploys the same shape and the helper recipes below need no arguments.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+compose := "docker compose -f deploy/docker-compose.yml"
+compose_ts := "docker compose -f deploy/docker-compose.tailscale.yml"
+env_file := "deploy/.env"
+tls_dir := "deploy/tls"
+
+# First deploy only; afterwards deploy/.env wins. Override with `just port=9080 up`.
+port := env("RELAY_PORT", "8080")
+health_port := env("RELAY_HEALTH_PORT", "8081")
+container := env("RELAY_CONTAINER", "hypeterm-relay")
+
+_default:
+    @just --list --unsorted
+
+# ---------------------------------------------------------------------- deploy
+
+# Build and deploy the latest container. MODE is local (default), tailscale, proxy or tls.
+up mode="local":
+    #!/usr/bin/env bash
+    # One script rather than a chain of `just _helper` calls: a nested just runs in a
+    # fresh process and would not inherit `just port=9080 up`-style overrides.
+    set -euo pipefail
+
+    mode="{{mode}}"
+    case "$mode" in
+      local|tailscale|proxy|tls) ;;
+      *) echo "unknown mode: $mode (expected local, tailscale, proxy or tls)" >&2; exit 1 ;;
+    esac
+    # In tailscale mode the sidecar owns the network namespace and the published ports.
+    dc="{{compose}}"
+    [[ "$mode" == "tailscale" ]] && dc="{{compose_ts}}"
+    if [[ "$mode" == "tls" && ! -f {{tls_dir}}/cert.pem ]]; then
+      echo "tls mode needs {{tls_dir}}/cert.pem and key.pem — run: just tls-selfsigned" >&2
+      exit 1
+    fi
+
+    mkdir -p {{tls_dir}}
+    if [[ ! -f {{env_file}} ]]; then
+      echo "==> generating bootstrap secrets in {{env_file}}"
+      umask 077
+      {
+        echo "# Bootstrap values only: what the relay needs to find and decrypt its"
+        echo "# database. Behaviour lives in the database settings. Do not commit."
+        echo "# Generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "RELAY_SECRET_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+        echo "RELAY_OPERATOR_TOKEN=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+      } > {{env_file}}
+      chmod 600 {{env_file}}
+    fi
+
+    # Remember the deployment shape. Compose reads deploy/.env for substitution, so
+    # this also drives port publishing, and the helper recipes read it back.
+    set_var() {
+      local key="$1" value="$2"
+      if grep -q "^${key}=" {{env_file}}; then
+        sed -i "s|^${key}=.*|${key}=${value}|" {{env_file}}
+      else
+        echo "${key}=${value}" >> {{env_file}}
+      fi
+    }
+    source {{env_file}}
+    port="${RELAY_PORT:-{{port}}}"
+    health_port="${RELAY_HEALTH_PORT:-{{health_port}}}"
+    # An explicit override on this invocation wins over the remembered value.
+    [[ "{{port}}" != "8080" ]] && port="{{port}}"
+    [[ "{{health_port}}" != "8081" ]] && health_port="{{health_port}}"
+    bind="${RELAY_BIND:-127.0.0.1}"
+    [[ "$mode" == "tls" ]] && bind="${RELAY_BIND:-0.0.0.0}"
+
+    # Fail early and legibly on a port clash, rather than surfacing a raw Docker
+    # networking error after a full build.
+    for p in "$port" "$health_port"; do
+      if docker ps --filter "name=^{{container}}$" --format '{{{{.Ports}}' | grep -q ":${p}->"; then
+        continue    # already ours; `just up` is re-runnable
+      fi
+      if ss -ltn 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"; then
+        echo "port ${p} is already in use on this host." >&2
+        echo "  pick another:  just port=9080 health_port=9081 up $mode" >&2
+        exit 1
+      fi
+    done
+
+    set_var RELAY_MODE "$mode"
+    set_var RELAY_PORT "$port"
+    set_var RELAY_HEALTH_PORT "$health_port"
+    set_var RELAY_BIND "$bind"
+
+    if [[ "$mode" == "tailscale" ]]; then
+      # Pick a dedicated subnet once and remember it. A hard-coded range would collide
+      # with whatever else this machine already runs, so probe for a free one.
+      if [[ -z "${RELAY_SUBNET:-}" ]]; then
+        printf '==> selecting a free subnet'
+        # Docker allocates whole /16s by default, so a free /29 has to be looked for
+        # in a range no existing network covers — probing inside one /16 would never
+        # succeed on a host that already uses it. Creating the network is the only
+        # reliable overlap test, so candidates are tried for real.
+        candidates=""
+        for n in $(seq 16 31); do candidates="$candidates 172.${n}.250.0/29"; done
+        for n in $(seq 90 99); do candidates="$candidates 10.${n}.250.0/29"; done
+        for candidate in $candidates; do
+          if docker network create --driver bridge --subnet "$candidate" hypeterm-probe >/dev/null 2>&1; then
+            docker network rm hypeterm-probe >/dev/null 2>&1 || true
+            prefix="${candidate%.0/29}"
+            RELAY_SUBNET="$candidate"
+            set_var RELAY_SUBNET "$candidate"
+            set_var RELAY_TS_IP "${prefix}.2"
+            set_var RELAY_APP_IP "${prefix}.3"
+            echo " — ${candidate}"
+            break
+          fi
+          printf '.'
+        done
+        if [[ -z "${RELAY_SUBNET:-}" ]]; then
+          echo
+          echo "no free /29 found; set RELAY_SUBNET, RELAY_TS_IP and RELAY_APP_IP in {{env_file}} by hand" >&2
+          exit 1
+        fi
+        source {{env_file}}
+      fi
+      export RELAY_SUBNET RELAY_TS_IP RELAY_APP_IP
+
+      # The sidecar forwards decrypted traffic to a fixed address, so generate the
+      # serve config rather than committing one with a machine-specific address.
+      printf '{\n  "TCP": {\n    "443": {\n      "TCPForward": "%s:8080",\n      "TerminateTLS": "${TS_CERT_DOMAIN}"\n    }\n  }\n}\n' \
+        "$RELAY_APP_IP" > deploy/tailscale/serve.json
+    fi
+
+    echo "==> building image"
+    $dc build
+
+    if [[ "$mode" == "tailscale" ]]; then
+      # The sidecar must be authenticated before the relay is configured: the MagicDNS
+      # name it is issued becomes the relay's public origin.
+      echo "==> starting tailscale sidecar"
+      $dc up -d tailscale
+      ts="{{container}}-ts"
+
+      if [[ -z "${TS_AUTHKEY:-}" ]]; then
+        # Without a key this needs a login, and tailscaled otherwise gives up after a
+        # couple of minutes and restarts with a *new* URL. A long timeout keeps the
+        # first link valid long enough to actually go and click it.
+        export TS_EXTRA_ARGS="${TS_EXTRA_ARGS:---timeout=30m}"
+        echo
+        echo "    No TS_AUTHKEY is set, so this needs an interactive login."
+        echo
+        echo "    Smoother, and needed only once: generate an auth key at"
+        echo "      https://login.tailscale.com/admin/settings/keys"
+        echo "    add it to deploy/.env as   TS_AUTHKEY=tskey-auth-..."
+        echo "    and run this again — deploys are then fully unattended."
+        echo
+        echo "    Otherwise open the login link below. It stays valid for 30 minutes;"
+        echo "    if it is ever replaced, the current one is printed again."
+      fi
+
+      printf '==> joining tailnet'
+      state=""
+      last_url=""
+      for _ in $(seq 1 450); do
+        state=$(docker exec "$ts" tailscale status --json 2>/dev/null \
+                | grep -o '"BackendState"[^,]*' | head -1 | cut -d'"' -f4 || true)
+        [[ "$state" == "Running" ]] && break
+        # The auth URL rotates every time the sidecar restarts, so re-read it and
+        # announce it whenever it changes rather than printing a stale one once.
+        url=$(docker logs "$ts" 2>&1 | grep -o 'https://login.tailscale.com/a/[a-z0-9]*' | tail -1 || true)
+        if [[ -n "$url" && "$url" != "$last_url" ]]; then
+          echo
+          echo "    authorise here:  $url"
+          printf '    waiting'
+          last_url="$url"
+        fi
+        printf '.'; sleep 2
+      done
+      echo
+      if [[ "$state" != "Running" ]]; then
+        echo "tailscale did not join the tailnet (state: ${state:-unknown})" >&2
+        docker logs --tail 20 "$ts" >&2
+        exit 1
+      fi
+
+      # CertDomains is the authoritative answer to "what name can this node get a
+      # certificate for", and it is empty unless MagicDNS *and* HTTPS certificates are
+      # both enabled for the tailnet. Checking it here turns an otherwise late and
+      # opaque TLS failure into something actionable.
+      status_json=$(docker exec "$ts" tailscale status --json)
+      ts_name=$(echo "$status_json" | tr ',' '\n' | grep -A2 '"CertDomains"' \
+                | grep -o '[a-z0-9-]*\.[a-z0-9-]*\.ts\.net' | head -1 || true)
+      if [[ -z "$ts_name" ]]; then
+        suffix=$(echo "$status_json" | grep -o '"MagicDNSSuffix"[^,]*' | head -1 | cut -d'"' -f4 || true)
+        echo
+        echo "This tailnet cannot issue a certificate for this node yet, so TLS" >&2
+        echo "termination would fail. Enable both of these once, in the admin console:" >&2
+        echo "  https://login.tailscale.com/admin/dns" >&2
+        echo "    - MagicDNS" >&2
+        echo "    - HTTPS Certificates" >&2
+        echo "then run this again. Note that enabling HTTPS publishes this node's name" >&2
+        echo "  (${TS_HOSTNAME:-hypeterm-relay}.${suffix:-<tailnet>.ts.net})" >&2
+        echo "on a public certificate-transparency ledger." >&2
+        exit 1
+      fi
+      echo "==> tailnet name: $ts_name"
+      set_var RELAY_TS_NAME "$ts_name"
+    fi
+
+    # Transport settings for the chosen mode, applied through the same validation and
+    # audit path as the admin API. Everything else keeps its specification default.
+    # Via `docker exec` when the relay is already running. `compose run` starts a
+    # *second* container from the relay service, and in tailscale mode that service holds
+    # a fixed address, so the one-off collides with the live relay — "Address already in
+    # use". Because this step runs before `up -d`, that failure aborted the deploy
+    # *before the newly built image was ever started*, leaving the old container in
+    # place: a redeploy that reported failure but looked like it had half worked.
+    relay_cli() {
+      if docker ps --filter "name=^{{container}}$" --format '{{{{.Names}}' | grep -q .; then
+        docker exec {{container}} /usr/local/bin/terminal-relay "$@"
+      else
+        $dc run --rm --no-deps relay "$@"
+      fi
+    }
+
+    echo "==> applying $mode settings"
+    common=(server.listen_address=0.0.0.0:8080 server.health_listen_address=0.0.0.0:8081)
+    case "$mode" in
+      tailscale)
+        # Tailscale terminates TLS with a real certificate for the MagicDNS name and
+        # forwards raw TCP to 127.0.0.1 in the shared namespace. There is no
+        # forwarded-protocol header on a TCP forward, so the terminator is trusted by
+        # address instead — and the development loopback exemption stays off.
+        relay_cli settings set "${common[@]}" \
+          server.tls_enabled=false \
+          security.require_secure_transport=true \
+          security.allow_insecure_loopback=false \
+          "security.tls_terminated_by_networks=[\"${RELAY_SUBNET}\"]" \
+          "server.public_origin=https://${ts_name}"
+        ;;
+      local)
+        # Loopback-only: the published port is bound to 127.0.0.1 and the relay is
+        # told not to require TLS. Not for anything reachable off this host.
+        relay_cli settings set "${common[@]}" \
+          server.tls_enabled=false \
+          security.require_secure_transport=false \
+          "server.public_origin=http://localhost:${port}"
+        ;;
+      proxy)
+        # A TLS-terminating proxy in front asserts the original scheme. Docker's
+        # default bridge ranges are trusted; narrow this to your proxy's address.
+        relay_cli settings set "${common[@]}" \
+          server.tls_enabled=false \
+          security.require_secure_transport=true \
+          security.trusted_proxy_enabled=true \
+          'security.trusted_proxy_networks=["172.16.0.0/12","192.168.0.0/16","10.0.0.0/8"]' \
+          "server.public_origin=${RELAY_PUBLIC_ORIGIN:-https://localhost}"
+        ;;
+      tls)
+        relay_cli settings set "${common[@]}" \
+          server.tls_enabled=true \
+          server.tls_certificate_path=/etc/terminal-relay/tls/cert.pem \
+          server.tls_private_key_path=/etc/terminal-relay/tls/key.pem \
+          security.require_secure_transport=true \
+          "server.public_origin=${RELAY_PUBLIC_ORIGIN:-https://localhost:${port}}"
+        ;;
+    esac
+
+    echo "==> starting"
+    $dc up -d
+
+    printf '==> waiting for health'
+    healthy=false
+    for _ in $(seq 1 90); do
+      status=$(docker inspect --format '{{{{.State.Health.Status}}' {{container}} 2>/dev/null || echo starting)
+      case "$status" in
+        healthy)   echo " — healthy"; healthy=true; break ;;
+        unhealthy) echo " — unhealthy"; docker logs --tail 30 {{container}}; exit 1 ;;
+        *)         printf '.'; sleep 1 ;;
+      esac
+    done
+    if [[ "$healthy" != true ]]; then
+      echo " — timed out"; docker logs --tail 30 {{container}}; exit 1
+    fi
+
+    scheme=$([[ "$mode" == "tls" ]] && echo https || echo http)
+    api="${scheme}://127.0.0.1:${port}"
+    [[ "$mode" == "tailscale" ]] && api="https://${ts_name}   (from any device on your tailnet)"
+    cat <<SUMMARY
+
+      hypeterm relay is up
+      mode        $mode
+      api         ${api}
+      health      http://127.0.0.1:${health_port}/healthz   (isolated listener)
+      operator    just token
+      logs        just logs
+
+    SUMMARY
+    case "$mode" in
+      local) echo "      NOTE: local mode does not require TLS and is published on loopback only."
+             echo "            Do not expose this port. For real use: just up proxy, or just up tls." ;;
+      tailscale)
+             echo "      Point the mobile app at https://${ts_name} — the certificate is a real one,"
+             echo "      issued and renewed by Tailscale, so client-side validation just works."
+             echo "      Nothing is exposed to the internet; only devices on your tailnet can reach it." ;;
+      proxy) echo "      NOTE: point your TLS-terminating proxy at 127.0.0.1:${port} and have it set"
+             echo "            X-Forwarded-Proto. Narrow security.trusted_proxy_networks to it." ;;
+      tls)   if [[ -f {{tls_dir}}/.self-signed ]]; then
+               echo "      NOTE: self-signed certificate. Clients must trust it explicitly, and the"
+               echo "            Android client will refuse it in a release build."
+             fi ;;
+    esac
+    echo
+
+# Stop the container, keeping the data volume.
+down:
+    @$(just _dc) down
+
+# Restart without rebuilding.
+restart:
+    @$(just _dc) restart
+
+# Build the image without deploying.
+build:
+    {{compose}} build
+
+# ------------------------------------------------------------------- operate
+
+# Follow the logs.
+logs lines="100":
+    @$(just _dc) logs -f --tail {{lines}}
+
+# Container, health and readiness status.
+status:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    $(just _dc) ps
+    printf '\nhealth   '
+    docker inspect --format '{{{{.State.Health.Status}}' {{container}} 2>/dev/null || echo "not running"
+    printf 'readyz   '
+    source {{env_file}} 2>/dev/null || true
+    curl -fsS -o /dev/null -w '%{http_code}\n' \
+      "http://127.0.0.1:${RELAY_HEALTH_PORT:-{{health_port}}}/readyz" 2>/dev/null || echo unreachable
+
+    # A tailnet node key expires after 180 days by default, and when it does the node
+    # drops off the tailnet and needs re-authenticating by hand. Surface it, because
+    # the failure otherwise arrives silently months later.
+    if [[ "${RELAY_MODE:-}" == "tailscale" ]]; then
+      expiry=$(docker exec "{{container}}-ts" tailscale status --json 2>/dev/null \
+               | grep -o '"KeyExpiry"[^,]*' | head -1 | cut -d'"' -f4 || true)
+      printf 'tailnet  '
+      if [[ -z "$expiry" ]]; then
+        echo "key expiry disabled — nothing to renew"
+      else
+        left=$(( ( $(date -u -d "$expiry" +%s) - $(date -u +%s) ) / 86400 ))
+        echo "node key expires ${expiry%T*} (${left} days)"
+        if (( left < 30 )); then
+          echo "         ^ re-authenticate, or disable key expiry for this machine:"
+          echo "           https://login.tailscale.com/admin/machines"
+        fi
+      fi
+    fi
+
+# Print the operator token, for the admin API.
+token:
+    @grep '^RELAY_OPERATOR_TOKEN=' {{env_file}} | cut -d= -f2-
+
+# How to reach the relay's own CLI.
+#
+# Exec into the running container; fall back to a one-off only when nothing is running,
+# which is the first deploy. A one-off cannot be the default: in tailscale mode the relay
+# service has a fixed address, so a second container on that network collides with the
+# live relay and fails with "Address already in use".
+_relay_cli:
+    #!/usr/bin/env bash
+    if docker ps --filter "name=^{{container}}$" --format '{{{{.Names}}' | grep -q .; then
+      echo "docker exec {{container}} /usr/local/bin/terminal-relay"
+    else
+      echo "$(just _dc) run --rm --no-deps relay"
+    fi
+
+# Read settings: `just settings`, or `just settings server.listen_address`.
+settings *names:
+    @$(just _relay_cli) settings get {{names}}
+
+# A running instance observes the committed revision within
+# settings.propagation_interval_ms and rebinds its own listener, so no restart here.
+#
+# Apply settings, e.g. `just set logging.level=debug features.input_enabled=false`.
+set +pairs:
+    @$(just _relay_cli) settings set {{pairs}}
+
+# Call the admin API with the operator token: `just admin /v1/admin/settings`.
+admin path="/v1/admin/settings":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    body=$(just _curl "{{path}}")
+    if command -v jq >/dev/null; then echo "$body" | jq .; else echo "$body"; fi
+
+# Force a checkpoint of buffered terminal output.
+flush:
+    @just _curl /v1/admin/flush POST
+
+# Prometheus metrics.
+metrics:
+    @just _curl /metrics
+
+# ----------------------------------------------------------------------- TLS
+
+# Replace with a real certificate for anything reachable from the network: the Android
+# client validates certificates and will refuse a self-signed one in a release build.
+#
+# Generate a self-signed certificate for local TLS.
+tls-selfsigned host="localhost":
+    @mkdir -p {{tls_dir}}
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+        -subj "/CN={{host}}" \
+        -addext "subjectAltName=DNS:{{host}},DNS:localhost,IP:127.0.0.1" \
+        -keyout {{tls_dir}}/key.pem -out {{tls_dir}}/cert.pem 2>/dev/null
+    @# The container runs as uid 65532 and must read these. A throwaway local key may
+    @# be world-readable; mount a production key with ownership matching that user.
+    @chmod 644 {{tls_dir}}/cert.pem {{tls_dir}}/key.pem
+    @touch {{tls_dir}}/.self-signed
+    @echo "wrote {{tls_dir}}/cert.pem and key.pem (self-signed, 365 days)"
+    @echo "now run: just up tls"
+
+# --------------------------------------------------------------- development
+
+# Run the full test suite.
+test:
+    cargo test
+
+# Format, lint and test — what CI should run.
+check:
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test
+
+# Run the relay directly on the host, without Docker.
+dev:
+    RELAY_DATA_DIR=.dev-data RELAY_OPERATOR_TOKEN=dev-token cargo run
+
+# ------------------------------------------------------------------- destroy
+
+# Stop and remove the container, and permanently delete the data volume.
+[confirm("this deletes all identities, devices and terminal history. continue?")]
+destroy:
+    @$(just _dc) down -v
+    @echo "volume removed; {{env_file}} kept so credentials survive a redeploy"
+
+# ------------------------------------------------------------------ internals
+
+# The compose file for the deployment recorded in deploy/.env.
+_dc:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mode=$(grep '^RELAY_MODE=' {{env_file}} 2>/dev/null | cut -d= -f2- || echo local)
+    if [[ "$mode" == "tailscale" ]]; then echo "{{compose_ts}}"; else echo "{{compose}}"; fi
+
+# Authenticated request against the deployment recorded in deploy/.env.
+_curl path method="GET":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source {{env_file}}
+    if [[ "${RELAY_MODE:-local}" == "tailscale" ]]; then
+      # The API is not published to the host in tailscale mode, and the relay only
+      # treats the sidecar's network as TLS-terminated, so the request is made from
+      # the sidecar rather than from here.
+      docker exec "{{container}}-ts" wget -qO- \
+        --header="authorization: Bearer ${RELAY_OPERATOR_TOKEN}" \
+        --method={{method}} "http://${RELAY_APP_IP}:8080{{path}}"
+      exit 0
+    fi
+    scheme=$([[ "${RELAY_MODE:-local}" == "tls" ]] && echo https || echo http)
+    # A self-signed certificate is in no trust store, so a local probe needs -k.
+    insecure=()
+    [[ "${RELAY_MODE:-}" == "tls" && -f {{tls_dir}}/.self-signed ]] && insecure=(-k)
+    curl -fsS -X {{method}} "${scheme}://127.0.0.1:${RELAY_PORT:-{{port}}}{{path}}" \
+      -H "authorization: Bearer ${RELAY_OPERATOR_TOKEN}" "${insecure[@]}"

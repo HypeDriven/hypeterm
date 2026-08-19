@@ -1,0 +1,25 @@
+# Rust
+target/
+
+# Host and Android builds
+build/
+build-*/
+.gradle/
+.cxx/
+.kotlin/
+
+# Per-machine paths and generated deployment state. See each project's own
+# .gitignore for the details; these are repeated here so a clone rooted at the
+# top level cannot commit them either.
+local.properties
+.env
+deploy/.env
+deploy/tls/*
+!deploy/tls/.gitkeep
+
+# Tailscale node state written by test runs. Never committed: it holds node keys.
+.local/
+
+# Python bytecode from the fake relay.
+__pycache__/
+*.pyc

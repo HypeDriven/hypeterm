@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark by default: a terminal on a light chrome is uncomfortable, and the
+         renderer's own palette is dark (spec §13 keeps contrast configurable). -->
+    <style name="Theme.Hypeterm" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101216</item>
+        <item name="android:colorBackground">#101216</item>
+        <item name="android:textColorPrimary">#D8D8D8</item>
+        <item name="android:statusBarColor">#181C22</item>
+        <item name="android:navigationBarColor">#181C22</item>
+    </style>
+</resources>

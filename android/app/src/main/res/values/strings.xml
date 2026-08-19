@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hypeterm</string>
+
+    <!-- Connection states. Text, never colour alone (spec §13). -->
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_authenticating">Authenticating…</string>
+    <string name="status_attached">Attached to %1$s</string>
+    <string name="status_attached_read_only">Attached to %1$s — read only</string>
+    <string name="status_reconnecting">Reconnecting…</string>
+    <string name="status_terminal_closed">The remote terminal ended</string>
+    <string name="status_failed">Not connected: %1$s</string>
+    <string name="status_pairing_required">This device is not paired yet</string>
+
+    <string name="terminal_content_description">Terminal output. Long press to select text.</string>
+    <string name="copy_selection">Copy selection</string>
+    <string name="copied">Copied</string>
+    <string name="paste">Paste</string>
+    <string name="reconnect">Reconnect</string>
+    <string name="leave">Leave</string>
+    <string name="font_smaller">A−</string>
+    <string name="font_larger">A+</string>
+
+    <!-- Following the newest output. The control appears only while the view is not
+         following, so its presence is the state; the text says so too, never colour
+         alone (spec §13). -->
+    <string name="follow_output">Follow</string>
+    <string name="follow_output_on">Follow: on</string>
+    <string name="follow_output_off">Follow: off</string>
+    <string name="follow_output_on_description">Following the latest output. Tap to stop.</string>
+    <string name="follow_output_off_description">Not following the latest output. Tap to follow it.</string>
+    <string name="follow_latest">↓ Latest</string>
+    <string name="follow_latest_description">Jump to the latest output and keep following it</string>
+    <string name="follow_paused_announcement">No longer following the latest output</string>
+    <string name="follow_resumed_announcement">Following the latest output</string>
+
+    <!-- Pairing. There are no usernames or passwords: an identity is a public key. -->
+    <string name="pairing_explanation">On the machine you want to reach, run
+        <b>hypeterm-publish pair-code</b> and paste what it prints below. That is the whole of
+        it: this device makes its own key and keeps the private half, and the code carries
+        the relay address, so there is nothing else to fill in. The code is valid for a few
+        minutes.</string>
+    <string name="pairing_relay_heading">Relay</string>
+    <string name="pairing_relay_unset">Not paired yet</string>
+    <string name="pairing_code_hint">Pairing code (HT1.…)</string>
+    <string name="pair_with_code">Pair this device</string>
+    <string name="pairing_in_progress">Pairing…</string>
+    <string name="pairing_code_required">Paste the pairing code first</string>
+
+    <!-- Embedded Tailscale node. It carries only this app's traffic: it is not a VPN
+         and does not route anything else on the device. -->
+    <string name="tunnel_section">Reach the relay over Tailscale</string>
+    <string name="tunnel_explanation">Hypeterm can join your tailnet by itself, so a relay
+        that is not exposed to the internet is still reachable. Only this app\'s traffic goes
+        through it — it is not a device-wide VPN, and no diagnostics are uploaded.</string>
+    <string name="tunnel_enable">Use Tailscale</string>
+    <string name="tunnel_auth_key_hint">Auth key (optional — leave empty to sign in with a browser)</string>
+    <string name="tunnel_connect">Connect Tailscale</string>
+    <string name="tunnel_disconnect">Disconnect</string>
+    <string name="tunnel_sign_out">Forget this tailnet</string>
+    <string name="tunnel_open_login">Open the login page</string>
+    <string name="tunnel_allow_cleartext">Allow plain HTTP inside the tunnel</string>
+    <string name="tunnel_status_unavailable">Tailscale is not included in this build</string>
+    <string name="tunnel_status_disabled">Off — the relay is reached directly</string>
+    <string name="tunnel_status_stopped">Not started</string>
+    <string name="tunnel_status_waiting">Waiting for you to authorise this device…</string>
+    <string name="tunnel_status_starting">Starting… (%1$s)</string>
+    <string name="tunnel_status_running">Connected as %1$s (%2$s)</string>
+    <string name="tunnel_status_error">Tailscale: %1$s</string>
+    <string name="tunnel_restart_needed">Restarting the session to apply the change</string>
+
+    <!-- Terminal list. -->
+    <string name="no_terminals">No open terminals</string>
+    <string name="refresh">Refresh</string>
+    <string name="new_terminal">New terminal</string>
+    <string name="new_terminal_working">Asking…</string>
+    <string name="new_terminal_none">No machine of yours is accepting new terminals. Run
+        hypeterm-publish remote-open --enable on the machine you want to reach.</string>
+    <string name="connection_settings">Connection settings</string>
+    <string name="list_connected">Connected</string>
+    <string name="list_connecting">Connecting…</string>
+    <string name="list_unknown_error">the relay could not be reached</string>
+    <string name="list_tunnel_stopped">Tailscale is not running — open Connection settings</string>
+    <string name="list_tunnel_starting">Tailscale is starting…</string>
+    <string name="list_tunnel_needs_login">Tailscale needs authorising — open Connection settings</string>
+    <string name="terminal_row">%1$s — %2$d×%3$d</string>
+    <string name="terminal_row_read_only">%1$s — %2$d×%3$d (read only)</string>
+</resources>

@@ -1,0 +1,105 @@
+# Terminal Mirror Relay on a tailnet.
+#
+# A Tailscale sidecar joins your tailnet and terminates TLS for the relay. Nothing is
+# published to the internet, no ports are forwarded, and the certificate is a real one
+# issued for the node's MagicDNS name — which matters because the Android client
+# validates certificates in release builds and would reject a self-signed one.
+#
+# The two containers are deliberately *independent*, connected by a dedicated bridge
+# network rather than a shared network namespace. `network_mode: service:tailscale`
+# would be simpler, but it makes the relay's networking hostage to the sidecar: when
+# the sidecar restarts it gets a new namespace, and the relay is left orphaned with a
+# dead network while still reporting healthy on its own loopback. A crash restart at
+# 03:00 is not orchestrated by Compose, so `depends_on` cannot rescue that.
+#
+# Brought up by `just up tailscale`; this file is used on its own, not as an override.
+
+services:
+  tailscale:
+    image: ${TS_IMAGE:-tailscale/tailscale:stable}
+    container_name: ${RELAY_CONTAINER:-hypeterm-relay}-ts
+    hostname: ${TS_HOSTNAME:-hypeterm-relay}
+    restart: unless-stopped
+
+    environment:
+      # The node name, and therefore the MagicDNS name clients connect to.
+      TS_HOSTNAME: ${TS_HOSTNAME:-hypeterm-relay}
+      # Node identity. On a volume so a restart rejoins as the same node rather than
+      # registering a new one each time.
+      TS_STATE_DIR: /var/lib/tailscale
+      # Userspace networking needs no NET_ADMIN and no /dev/net/tun.
+      TS_USERSPACE: "true"
+      # Only authenticate when not already logged in, so a restart is not a re-login.
+      TS_AUTH_ONCE: "true"
+      # Optional: set in deploy/.env to join non-interactively. Without it the
+      # container logs a login URL, which `just up tailscale` surfaces.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+
+    volumes:
+      - ts-state:/var/lib/tailscale
+      - ./tailscale:/config:ro
+
+    networks:
+      relaynet:
+        ipv4_address: ${RELAY_TS_IP:?run just up tailscale, which picks a free subnet}
+
+    # Exits non-zero until the node is logged in and running, which is what
+    # `just up tailscale` waits on before configuring the relay.
+    healthcheck:
+      test: ["CMD", "tailscale", "status", "--peers=false"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  relay:
+    # Inherit the service definition rather than duplicate it, so the image, volumes,
+    # environment, security options and health check stay defined in one place.
+    extends:
+      file: docker-compose.yml
+      service: relay
+
+    networks:
+      relaynet:
+        # Fixed address so the sidecar's forward target needs no DNS, and so the
+        # trust boundary below stays meaningful across restarts.
+        ipv4_address: ${RELAY_APP_IP:?run just up tailscale, which picks a free subnet}
+
+    # Only the isolated health listener is published, for local probes and
+    # `just status`. The API is deliberately *not* published: on this network the
+    # sidecar is trusted as the TLS terminator, and a host-published port would let
+    # anything on this machine inherit that trust over plain HTTP. Tailnet clients
+    # reach the API through the sidecar; local admin goes through it too.
+    # !override replaces the inherited list; !reset would only clear it.
+    ports: !override
+      - "${RELAY_HEALTH_BIND:-127.0.0.1}:${RELAY_HEALTH_PORT:-8081}:8081"
+
+    # Ordering only. Deliberately not `service_healthy`: the sidecar is unhealthy
+    # whenever the tailnet is unreachable, and the relay has no reason to stay down
+    # for that — it serves its health endpoint and holds its durable state either way.
+    depends_on:
+      - tailscale
+
+networks:
+  relaynet:
+    name: ${RELAY_NETWORK:-hypeterm-relaynet}
+    ipam:
+      config:
+        # A small, dedicated subnet, chosen by `just up tailscale` from a free range
+        # and remembered in deploy/.env. `security.tls_terminated_by_networks` trusts
+        # exactly this range, so it must contain nothing but these two containers.
+        - subnet: ${RELAY_SUBNET:?run just up tailscale, which picks a free subnet}
+
+volumes:
+  relay-data:
+    name: ${RELAY_VOLUME:-hypeterm-relay-data}
+  ts-state:
+    name: ${TS_VOLUME:-hypeterm-relay-ts-state}

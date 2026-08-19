@@ -1,0 +1,77 @@
+# Deployment for the Terminal Mirror Relay (spec §8).
+#
+# Driven by the justfile: `just up` writes deploy/.env, applies the settings for the
+# chosen mode, and brings this stack up. Everything here is either a container concern
+# or a bootstrap value — behaviour lives in the database, reachable through
+# `just settings` or PATCH /v1/admin/settings.
+
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ${RELAY_IMAGE:-hypeterm-relay:latest}
+    container_name: ${RELAY_CONTAINER:-hypeterm-relay}
+    restart: unless-stopped
+
+    # Bootstrap secrets, generated once by `just up` and kept out of version control.
+    env_file:
+      - .env
+
+    environment:
+      RELAY_DATA_DIR: /var/lib/terminal-relay
+      RELAY_DB_PATH: /var/lib/terminal-relay/relay.db
+      RELAY_INSTANCE_ID: ${RELAY_INSTANCE_ID:-hypeterm-relay}
+
+    volumes:
+      # Durable state: identities, devices, terminal metadata, committed offsets,
+      # settings and replay checkpoints. Never the container's writable layer.
+      - relay-data:/var/lib/terminal-relay
+      # TLS material, used only in `tls` mode. Read-only; empty otherwise.
+      - ./tls:/etc/terminal-relay/tls:ro
+
+    # Everything else is read-only; /tmp is a small tmpfs.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    ports:
+      # Bound to loopback by default. Set RELAY_BIND=0.0.0.0 only once TLS is
+      # terminated, either here or by a proxy in front.
+      - "${RELAY_BIND:-127.0.0.1}:${RELAY_PORT:-8080}:8080"
+      # Isolated plain-HTTP health listener, for orchestrator probes only.
+      - "${RELAY_HEALTH_BIND:-127.0.0.1}:${RELAY_HEALTH_PORT:-8081}:8081"
+
+    # SIGTERM starts the drain; allow more than server.shutdown_deadline_seconds so
+    # dirty terminal output is committed before the container is killed.
+    stop_signal: SIGTERM
+    stop_grace_period: 45s
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Uses the binary's own probe against the isolated health listener, so the check
+    # keeps working when the main listener moves to TLS.
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/terminal-relay
+        - healthcheck
+        - 127.0.0.1:8081
+        - /readyz
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  relay-data:
+    name: ${RELAY_VOLUME:-hypeterm-relay-data}

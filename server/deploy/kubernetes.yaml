@@ -1,0 +1,147 @@
+# Example Kubernetes deployment for the Terminal Mirror Relay (spec §8).
+#
+# Single instance, which the specification says is sufficient for version 1. A
+# multi-instance deployment additionally needs shared durable state with globally
+# consistent per-terminal offset serialisation, ticket consumption, revocation and
+# subscriber fan-out; sticky sessions alone are not a correctness guarantee.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: terminal-relay-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: terminal-relay-bootstrap
+type: Opaque
+stringData:
+  # 32 bytes, base64url encoded. Encrypts secrets stored in the database and is
+  # deliberately not stored in that database.
+  secret-key: "REPLACE_WITH_BASE64URL_32_BYTES"
+  # Seeds auth.operator_token_hash on first initialisation only.
+  operator-token: "REPLACE_WITH_OPERATOR_TOKEN"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: terminal-relay
+spec:
+  selector:
+    app: terminal-relay
+  ports:
+    - name: https
+      port: 443
+      targetPort: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: terminal-relay
+spec:
+  replicas: 1
+  strategy:
+    # Durable state is a ReadWriteOnce volume and version 1 is single-instance, so
+    # the old pod must go away before the new one starts.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: terminal-relay
+  template:
+    metadata:
+      labels:
+        app: terminal-relay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Must exceed server.shutdown_deadline_seconds so dirty terminal output is
+      # committed before the container is killed.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: relay
+          image: terminal-relay:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: api
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          env:
+            - name: RELAY_DATA_DIR
+              value: /var/lib/terminal-relay
+            - name: RELAY_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RELAY_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: terminal-relay-bootstrap
+                  key: secret-key
+            - name: RELAY_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: terminal-relay-bootstrap
+                  key: operator-token
+          # Probes use the isolated plain-HTTP health listener, configured via
+          # server.health_listen_address. Set it to 127.0.0.1:8081 to keep it
+          # loopback-only, or 0.0.0.0:8081 for kubelet probes as used here.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 2
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/terminal-relay
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # Bound by the replay window per terminal plus the dirty-byte budget:
+              # limits.max_active_terminals_per_device * terminal.replay_capacity_bytes
+              # plus persistence.memory_pressure_dirty_bytes.
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: terminal-relay-data
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

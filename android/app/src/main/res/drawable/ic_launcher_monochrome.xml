@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon variant (Android 13+ launchers tint it), so only the silhouette
+     matters: one flat colour, same geometry as the foreground. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M31,33 L53,54 L31,75"
+        android:strokeWidth="10"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeColor="#FF000000" />
+    <path
+        android:pathData="M63,70 L77,70"
+        android:strokeWidth="10"
+        android:strokeLineCap="round"
+        android:strokeColor="#FF000000" />
+</vector>

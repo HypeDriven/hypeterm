@@ -1,0 +1,11 @@
+/target
+
+# Deployment state. deploy/.env holds generated bootstrap secrets and the remembered
+# mode and ports; neither it nor TLS key material may be committed.
+/deploy/.env
+/deploy/tls/*
+!/deploy/tls/.gitkeep
+
+# Local `just dev` data directory.
+/.dev-data
+deploy/tailscale/serve.json

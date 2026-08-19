@@ -1,0 +1,15 @@
+# Host builds
+build/
+build-*/
+
+# Gradle / Android
+.gradle/
+local.properties
+app/build/
+*.iml
+.cxx/
+
+# Test artefacts
+*.ppm
+core.*
+crash-*
