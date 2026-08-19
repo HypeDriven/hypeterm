@@ -45,6 +45,11 @@ class TerminalListActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Survives recreation, or the shortcut fires again on a screen the user has
+        // already left: with one terminal mirrored, a list activity rebuilt after
+        // Android reclaimed it would re-attach immediately and there would be no way
+        // back to this screen — which is where the button to open a terminal lives.
+        autoOpened = savedInstanceState?.getBoolean(STATE_AUTO_OPENED) == true
         client = Hypeterm.get(this)
         setContentView(buildLayout())
 
@@ -316,7 +321,13 @@ class TerminalListActivity : Activity() {
         })
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_AUTO_OPENED, autoOpened)
+    }
+
     private companion object {
         const val POLL_INTERVAL_MS = 4000L
+        const val STATE_AUTO_OPENED = "auto_opened"
     }
 }
