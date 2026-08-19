@@ -13,9 +13,8 @@ nothing is executed on the device.
 the platform sees — app name, package, native library, log tag — is Hypeterm.
 
 `spec.md` (Draft 0.2) is normative. The server it talks to is specified in
-`../server/spec.md`, and `../server/RECONCILIATION.md` settles the conflicts between the
-two; read it before changing anything protocol-shaped. Every open item in the old §18
-is resolved; §19 lists what genuinely remains.
+`../server/spec.md`, and `../server/INTEGRATION.md` is the contract between the two;
+read it before changing anything protocol-shaped. §19 lists what remains.
 
 ## Commands
 
@@ -119,7 +118,7 @@ loss. What remains unmeasured is spec §14's performance numbers.
 - **An offset is a byte count**, not a message counter, and it is parsed exactly from its
   literal so 64-bit values never pass through a double.
 - **Unacknowledged input is never resent.** After an ambiguous disconnect, tell the user;
-  do not guess (relay reconciliation §2.8).
+  do not guess (relay integration §7).
 - **Nothing sensitive reaches a log.** `TM_LOG_PAYLOAD` compiles away outside debug
   builds; `Log::Redacted()`, `Log::ByteCount()` and `SanitizeForMessage` are the only
   permitted representations of anything that came off the wire.

@@ -7,7 +7,7 @@ Implements spec §12, with the transport rules from §7.4 and the logging rules 
 
 The client's credential is a **`client`-role device key**: an Ed25519 key pair
 generated on the phone. The identity's root private key never reaches the device
-(relay reconciliation §1.2), so a stolen or compromised phone costs the owner one
+(relay integration §1), so a stolen or compromised phone costs the owner one
 revocable device, not their identity.
 
 Revocation is server-side (`DELETE /v1/devices/{id}`) and takes effect immediately for

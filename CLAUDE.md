@@ -14,7 +14,7 @@ publisher (Rust)  ──▶  server (Rust/axum, containerised)  ──▶  andro
 ```
 
 `server/spec.md` (the relay) and `android/spec.md` (the client) are **normative** — RFC
-2119 documents, not design notes. `server/RECONCILIATION.md` is the integration
+2119 documents, not design notes. `server/INTEGRATION.md` is the integration
 contract between them; read it before changing anything protocol-shaped, in any of the
 three.
 

@@ -6,10 +6,9 @@ Primary implementation language: C++17 or later
 Rendering API: OpenGL ES 3.0 or later
 
 The supplied server API is the **Terminal Mirror Relay**, specified in
-`../server/spec.md`. Where this document previously left integration open, it now
-states the resolved behaviour; `../server/RECONCILIATION.md` records how each conflict
-between the two documents was settled and is the reference for anything protocol-shaped
-that this document summarises.
+`../server/spec.md`. The contract between the two documents is
+`../server/INTEGRATION.md`, which is the reference for anything protocol-shaped that
+this document summarises.
 
 ## 1. Purpose
 
@@ -424,11 +423,11 @@ The release is acceptable when all of the following are demonstrated:
 10. A terminal that does not accept input, or whose publisher is unreachable, attaches read-only and says so; typing into it is refused with a distinct, user-visible reason and nothing is sent.
 11. Pairing produces a device credential whose private key never leaves the device, and revoking that device from the server ends the client's access.
 
-## 18. Server API integration — resolved
+## 18. Server API integration
 
-Every item that previously blocked implementation freeze is answered by
-`../server/spec.md` and `../server/RECONCILIATION.md`. The answers, in the order the
-questions were originally asked:
+How the client integrates with the relay. `../server/spec.md` is normative and
+`../server/INTEGRATION.md` is the contract between the two documents; this section
+summarises what the client relies on:
 
 1. **Registration and authentication.** `POST /v1/auth/challenges` → sign the returned length-prefixed `signing_input` → `POST /v1/identities` (register) or `POST /v1/auth/tokens` (authenticate). Challenges are single-use, expire within five minutes, and are consumed by the first verification attempt whether or not it succeeds. The private key is stored in Keystore-backed storage (§12).
 2. **Refresh, revocation, logout, device registration.** There are no refresh tokens; re-running `authenticate_device` with the stored key is the refresh. Logout is discarding the local token. `DELETE /v1/devices/{id}` revokes server-side, immediately for new connections and within 30 seconds for live ones. Device registration needs both parties: the device signs, the identity authorises (§5.1).
@@ -450,6 +449,6 @@ No production protocol assumptions beyond this specification are embedded outsid
 These are product or environment decisions, not protocol gaps:
 
 1. **Reference device and measured performance.** §14's targets are stated against a device the project has not yet agreed on. The properties behind them are enforced by tests; the numbers need hardware.
-2. **Pairing ergonomics.** §5.1 currently transfers a public key and two identifiers by hand. A QR-code carrier, or a server-issued short-lived pairing code, would improve it without any protocol change.
+2. **Pairing ergonomics.** §5.1 accepts a short-lived pairing code (`hypeterm-publish pair-code`, consumed by `CompletePairingWithCode`), which carries the relay address, the identity and a token. A QR-code carrier for the same payload would remove the typing and needs no protocol change.
 3. **Remote clipboard writes.** OSC 52 writes remain disabled pending the separately reviewed security policy §8.1 requires.
 4. **Recorded terminal corpora.** §16.1 asks for recorded `vim`, `less`, `top` and `tmux` output; capturing it needs the reference environment.

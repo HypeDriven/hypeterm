@@ -15,8 +15,8 @@ authorization model in spec §4.5; version 1 remains served unchanged, and a ver
 peer never observes input. Command execution, file transfer and shell allocation
 remain out of scope — the relay conveys bytes, it does not interpret them.
 
-`RECONCILIATION.md` maps this contract onto the Android client specification and
-answers its twelve open integration items.
+`INTEGRATION.md` maps this contract onto the Android client specification: what a
+mirror client implements, and what it can rely on.
 
 ## Contents
 
@@ -509,7 +509,7 @@ or identity-level authority, or a client the ability to publish.
 Because `POST /v1/devices` needs an identity token, a phone is paired rather than
 self-registered: it shows its public key, and a machine holding the identity key
 registers it. Both parties act, which is what makes the pairing meaningful.
-`RECONCILIATION.md` §2.2 describes the flow.
+`INTEGRATION.md` §2 describes the flow.
 
 
 ## Tailscale

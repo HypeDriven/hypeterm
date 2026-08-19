@@ -1,8 +1,7 @@
 # Protocol integration
 
 How the client speaks to the Terminal Mirror Relay. The relay's specification is
-`../server/spec.md`; `../server/RECONCILIATION.md` answers the twelve open items that
-client spec §18 listed. Everything here lives in `core/src/api/`, and nothing outside
+`../server/spec.md`; `../server/INTEGRATION.md` is the contract between the two. Everything here lives in `core/src/api/`, and nothing outside
 that directory depends on it (spec §7.1).
 
 ## Identity, pairing and tokens
@@ -15,7 +14,7 @@ identity_id = base64url(SHA-256(lp("terminal-relay-identity-v1") || lp(algorithm
 ```
 
 The phone holds a **`client`-role device key**, never the identity key
-(reconciliation §1.2). Pairing therefore takes two parties:
+(integration §2). Pairing therefore takes two parties:
 
 1. The phone generates a key pair (`Controller::BeginPairing`) and shows the public key.
 2. On a machine holding the identity key, the owner requests a `register_device`

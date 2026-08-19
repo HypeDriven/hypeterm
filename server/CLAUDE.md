@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `spec.md` is the normative source of truth: an RFC 2119 specification for the **Terminal Mirror Relay**, a containerized service that relays terminal output from registered devices to authenticated clients over WebSockets, and terminal input back. Treat every MUST in `spec.md` as a hard requirement and §11 (23 numbered acceptance criteria) as the test plan. `README.md` maps each criterion to the test that covers it.
 
-The mirror is bidirectional as of protocol version 2. `RECONCILIATION.md` reconciles this server contract with `../android/spec.md` and answers that document's twelve open integration items — read it before changing anything the client depends on.
+The mirror is bidirectional as of protocol version 2. `INTEGRATION.md` states the contract this server presents to the client specified in `../android/spec.md` — read it before changing anything the client depends on.
 
 The implementation is Rust (edition 2024): axum + tokio for HTTP/WebSocket, bundled SQLite in WAL mode as the embedded database, ed25519-dalek for proof of possession, rustls for optional in-process TLS.
 
@@ -75,9 +75,9 @@ Integration tests each start a real server on an ephemeral loopback port with it
 
 ## Related repository
 
-`../android/spec.md` specifies a separate Android client (C++17) that consumes this service. `RECONCILIATION.md` is the bridge between the two documents: it records how each conflict was resolved and answers the Android spec's §18 open items. Keep it current when you change anything on the client-facing surface.
+`../android/spec.md` specifies a separate Android client (C++17) that consumes this service. `INTEGRATION.md` is the contract between the two documents. Keep it current when you change anything on the client-facing surface.
 
-Two conflicts were resolved by changing the *server*, and both are now implemented: terminal input (protocol version 2, spec §4.5 and §6.3), and the `client` device role that lets the phone hold its own credential instead of the identity's root key. `RECONCILIATION.md` §3 lists the edits the Android spec needed. The two largest are now done there — its §8.3 selects PTY-stream mode and its §7.2 speaks in byte offsets rather than revisions — so check that list against `../android/spec.md` before treating any item on it as outstanding.
+Two parts of the client-facing surface are worth knowing before you touch them: terminal input (protocol version 2, spec §4.5 and §6.3), and the `client` device role that lets the phone hold its own credential instead of the identity's root key. `INTEGRATION.md` is the contract for both — the client runs in PTY-stream mode and addresses everything by byte offset.
 
 ## Architecture the spec mandates
 
