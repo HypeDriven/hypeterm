@@ -6,8 +6,8 @@ remote terminal and sends keystrokes back; it never runs a shell on the device.
 The app ships as **Hypeterm** (`com.hypedriven.hypeterm`). `spec.md` is the normative
 specification and still calls the product "Terminal Mirror" — that is the specification
 document's name for it, not the shipped one. The server it talks to is specified in
-`../server/spec.md`, and `../server/RECONCILIATION.md` resolves the places where the
-two documents originally disagreed.
+`../server/spec.md`, and `../server/RECONCILIATION.md` defines how the two
+specifications fit together.
 
 ## Layout
 

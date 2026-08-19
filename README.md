@@ -87,7 +87,7 @@ publisher  ──▶  server  ──▶  android
 
 Each folder has its own README with build, test and deployment instructions, and its own
 specification: `android/spec.md` for the client, `server/spec.md` for the relay, and
-`server/RECONCILIATION.md` where the two originally disagreed.
+`server/RECONCILIATION.md`, which defines how the two fit together.
 
 ## Licence
 
