@@ -904,10 +904,35 @@ fn append_remote_open_log(log: &Path, line: &str) {
     }
 }
 
+/// Where this program lives, so a `run` child can be spawned from it.
+///
+/// Linux answers `current_exe()` out of `/proc/self/exe`, and once the binary has been
+/// replaced underneath a running daemon — `tools/install.sh` renames over it precisely
+/// so the old inode stays alive for processes already using it — that link resolves to
+/// the original path with a literal " (deleted)" appended. Spawning it is `ENOENT`, and
+/// every terminal a phone asks for fails that way until somebody restarts the daemon.
+///
+/// The path with the marker removed is the binary installed *now*, which is the one a
+/// new terminal should be running anyway. Fall back to it, and if even that is gone say
+/// what to do rather than raising a bare "no such file or directory" against a path the
+/// operator never typed.
 fn this_program() -> Result<OsString, String> {
-    std::env::current_exe()
-        .map(std::path::PathBuf::into_os_string)
-        .map_err(|e| format!("finding this program: {e}"))
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let exe = std::env::current_exe().map_err(|e| format!("finding this program: {e}"))?;
+    if exe.exists() {
+        return Ok(exe.into_os_string());
+    }
+    if let Some(trimmed) = exe.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        let replaced = std::path::PathBuf::from(OsString::from_vec(trimmed.to_vec()));
+        if replaced.exists() {
+            return Ok(replaced.into_os_string());
+        }
+    }
+    Err(format!(
+        "this program is no longer at {}; restart the daemon onto the installed build",
+        exe.display()
+    ))
 }
 
 /// A command detached from this daemon: its own session, no stdio of the daemon's, and
