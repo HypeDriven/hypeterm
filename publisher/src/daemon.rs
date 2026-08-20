@@ -13,6 +13,7 @@
 //! still publishes directly, one terminal at a time.
 
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -105,6 +106,54 @@ struct Shared {
 /// notices.
 const REMOTE_OPEN_BURST: usize = 3;
 const REMOTE_OPEN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Terminal emulators to try when the policy is `Auto`, and the arguments each wants
+/// before the command it should run.
+///
+/// `x-terminal-emulator` leads because where it exists it is the emulator the person
+/// sitting at this machine chose, and their choice beats this list's opinion.
+///
+/// Each asks for a **tab** wherever the emulator has them, so a phone opening a second
+/// terminal adds to the window the first one made instead of scattering windows across
+/// the desktop. All of these open the window themselves when there is not one yet, so
+/// the tab form is right for the first terminal as well as the fifth. The rest have no
+/// tabs to ask for — `kitty` and `wezterm` do, but only through a control socket that
+/// has to be enabled first, and a window is better than a terminal that never opens.
+const WINDOW_TERMINALS: &[(&str, &[&str])] = &[
+    ("x-terminal-emulator", &["-e"]),
+    ("gnome-terminal", &["--tab", "--"]),
+    ("konsole", &["--new-tab", "-e"]),
+    ("xfce4-terminal", &["--tab", "-x"]),
+    ("wezterm", &["start", "--"]),
+    ("alacritty", &["-e"]),
+    ("kitty", &["--"]),
+    ("foot", &[]),
+    ("xterm", &["-e"]),
+];
+
+/// The Windows Terminal window phone-opened terminals share.
+///
+/// Named rather than `-w 0`, which means "whichever window was last used": that would
+/// drop a shell the phone asked for into the window the person here is typing in. A
+/// name of its own collects them together and creates the window on first use.
+const WINDOWS_TERMINAL_WINDOW: &str = "hypeterm";
+
+/// A character no window may carry in its argv.
+///
+/// Windows Terminal parses its own command line and treats `;` as the separator
+/// between wt commands, so an argument holding one arrives split in two and the tail
+/// is read as a fresh `wt` subcommand. The label in that argv came off the network.
+/// Refused rather than escaped, and refused for every emulator rather than the one
+/// known to re-parse: falling back to a headless terminal costs the phone its window,
+/// while quoting that is wrong on one emulator costs it the guarantee.
+const NO_WINDOW_ARGUMENT: char = ';';
+
+/// How long an emulator is given to fail before the shell is hosted headlessly anyway.
+///
+/// Spawning one only proves the binary exists; an emulator that cannot reach the
+/// display exits a moment later. Without this the phone that asked would wait out the
+/// relay's timeout and be told nothing at all.
+const WINDOW_SETTLE: Duration = Duration::from_millis(300);
 
 /// Refuses a label rather than sanitising it.
 ///
@@ -522,7 +571,8 @@ async fn refuse(out: &mpsc::Sender<Vec<u8>>, code: &str, message: &str) -> Resul
 /// signal the whole foreground process group — cannot take every other tab's mirror
 /// down with it.
 pub fn spawn(state_file: &Path, log: &Path) -> Result<(), String> {
-    let mut command = detached_command(state_file, log)?;
+    let mut command = detached_command(&this_program()?, log)?;
+    command.arg("--state-file").arg(state_file);
     command.arg("daemon").arg("--detach");
     let mut child = command
         .spawn()
@@ -533,7 +583,8 @@ pub fn spawn(state_file: &Path, log: &Path) -> Result<(), String> {
 
 /// The second hop: replaces this short-lived process with the daemon proper.
 pub fn respawn_detached(state_file: &Path, log: &Path) -> Result<(), String> {
-    let mut command = detached_command(state_file, log)?;
+    let mut command = detached_command(&this_program()?, log)?;
+    command.arg("--state-file").arg(state_file);
     command.arg("daemon").arg("--foreground");
     command
         .spawn()
@@ -608,7 +659,7 @@ async fn host_for_request(shared: Arc<Shared>, request: session::OpenRequest) {
 
     // 6. Spawn. Fixed argv built with `arg`, no shell anywhere on this path.
     shared.hosting.fetch_add(1, Ordering::AcqRel);
-    let spawned = spawn_hosted_shell(&shared, &label, &request.request_id, cols, rows);
+    let spawned = spawn_hosted_shell(&shared, &label, &request.request_id, cols, rows).await;
     match spawned {
         Ok(()) => {
             // The child answers the request itself, by echoing `in_reply_to` on its own
@@ -629,37 +680,210 @@ async fn host_for_request(shared: Arc<Shared>, request: session::OpenRequest) {
     }
 }
 
-fn spawn_hosted_shell(
+/// Starts the shell a phone asked for, in a window on this machine's screen when the
+/// owner's policy allows one and this machine can put one there.
+///
+/// A window is what makes this a mirror rather than a remote spawn: the same shell is
+/// then in front of the person sitting here and on the phone, which is the arrangement
+/// somebody expects when they open a terminal on one and look for it on the other.
+async fn spawn_hosted_shell(
     shared: &Arc<Shared>,
     label: &str,
     request_id: &str,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut command = detached_command(&shared.state_file, &shared.log)?;
-    // Not the daemon's inherited environment and not `/`: the daemon was started by
-    // whichever `run` happened to be first, and "open me a shell" means the shell and
-    // directory the machine's owner recorded when they turned this on.
-    if !shared.remote.cwd.is_empty() {
-        command.current_dir(&shared.remote.cwd);
+    if let Some(emulator) = window_command(&shared.remote.window) {
+        match spawn_in_window(shared, &emulator, label, request_id).await {
+            Ok(()) => return Ok(()),
+            // Not fatal. A phone asked for a terminal, and one without a window here is
+            // still the terminal it asked for.
+            Err(error) => {
+                tracing::warn!(%error, "no window for a phone-opened terminal; hosting it headlessly");
+                append_remote_open_log(&shared.log, &format!("  no window: {error}\n"));
+            }
+        }
+    }
+
+    // Headless: nothing on this machine will render the shell, so the size the phone
+    // asked for is the only size there is.
+    let argv = hosting_argv(
+        &shared.state_file,
+        &shared.remote,
+        label,
+        request_id,
+        Some((cols, rows)),
+    )?;
+    let mut command = detached_command(&argv[0], &shared.log)?;
+    command.args(&argv[1..]);
+    apply_owner_environment(&shared.remote, &mut command);
+    command.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Opens the emulator with the hosting command appended to its argv.
+async fn spawn_in_window(
+    shared: &Arc<Shared>,
+    emulator: &[String],
+    label: &str,
+    request_id: &str,
+) -> Result<(), String> {
+    // No `--cols`/`--rows`: inside a window the window is the authority on its own size
+    // (spec §6.5) and `run` reads it from the tty it was handed. Forcing the phone's
+    // request on it would draw the shell into a corner of the window until the first
+    // size check corrected it, and the client renders whatever grid it is sent.
+    let argv = hosting_argv(&shared.state_file, &shared.remote, label, request_id, None)?;
+    if let Some(argument) = argv
+        .iter()
+        .find(|argument| argument.to_string_lossy().contains(NO_WINDOW_ARGUMENT))
+    {
+        return Err(format!(
+            "{argument:?} carries a {NO_WINDOW_ARGUMENT:?}, which an emulator may read as a second command"
+        ));
+    }
+    let mut command = detached_command(OsStr::new(&emulator[0]), &shared.log)?;
+    command.args(&emulator[1..]);
+    command.args(&argv);
+    apply_owner_environment(&shared.remote, &mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("{}: {e}", emulator[0]))?;
+    tokio::time::sleep(WINDOW_SETTLE).await;
+    match child.try_wait() {
+        // Exiting at once is not itself a failure: an emulator that hands the window to
+        // an already-running server process does exactly that, and succeeds.
+        Ok(Some(status)) if !status.success() => {
+            Err(format!("{} exited with {status}", emulator[0]))
+        }
+        Err(error) => Err(format!("{}: {error}", emulator[0])),
+        _ => Ok(()),
+    }
+}
+
+/// The emulator to open a window with, or `None` to host the shell headlessly.
+///
+/// Public so `remote-open --status` can report what `auto` resolves to rather than
+/// leaving somebody to find out by asking their phone for a terminal.
+pub fn window_command(policy: &crate::state::WindowPolicy) -> Option<Vec<String>> {
+    use crate::state::WindowPolicy;
+    match policy {
+        WindowPolicy::Never => None,
+        WindowPolicy::Command(argv) => (!argv.is_empty()).then(|| argv.clone()),
+        WindowPolicy::Auto => {
+            // Under WSL the desktop is Windows', and Windows Terminal is on it whether
+            // or not this Linux side has a display of its own. Tried first because it
+            // is the window the person at this machine is actually looking at — the
+            // row of WSL tabs this daemon exists for.
+            if let Some(argv) = windows_terminal() {
+                return Some(argv);
+            }
+            // Otherwise a window needs somewhere to appear. Without a display this is a
+            // server, where headless is not a degradation but the only thing that works.
+            if !has_display() {
+                return None;
+            }
+            WINDOW_TERMINALS.iter().find_map(|(program, flags)| {
+                let path = on_path(program)?;
+                let mut argv = vec![path.to_string_lossy().into_owned()];
+                argv.extend(flags.iter().map(|flag| (*flag).to_string()));
+                Some(argv)
+            })
+        }
+    }
+}
+
+/// Windows Terminal, reached over WSL interop, running the command back inside this
+/// distribution. `None` anywhere that is not WSL.
+fn windows_terminal() -> Option<Vec<String>> {
+    let distribution = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|d| !d.is_empty())?;
+    let wt = on_path("wt.exe")?;
+    Some(windows_terminal_argv(&wt.to_string_lossy(), &distribution))
+}
+
+fn windows_terminal_argv(wt: &str, distribution: &str) -> Vec<String> {
+    vec![
+        wt.to_string(),
+        "-w".into(),
+        WINDOWS_TERMINAL_WINDOW.into(),
+        "new-tab".into(),
+        "wsl.exe".into(),
+        "-d".into(),
+        distribution.to_string(),
+        "--".into(),
+    ]
+}
+
+fn has_display() -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
+}
+
+/// `which`, without the dependency: the first executable file of that name on `PATH`.
+fn on_path(program: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// The argv that hosts the shell: this same binary, in `run`.
+///
+/// Fixed arguments built one at a time, so no shell ever parses any of them.
+fn hosting_argv(
+    state_file: &Path,
+    remote: &crate::state::RemoteOpenConfig,
+    label: &str,
+    request_id: &str,
+    size: Option<(u16, u16)>,
+) -> Result<Vec<OsString>, String> {
+    let mut argv: Vec<OsString> = vec![
+        this_program()?,
+        "--state-file".into(),
+        state_file.into(),
+        "run".into(),
+        "--label".into(),
+        label.into(),
+        "--in-reply-to".into(),
+        request_id.into(),
+    ];
+    if let Some((cols, rows)) = size {
+        argv.push("--cols".into());
+        argv.push(cols.to_string().into());
+        argv.push("--rows".into());
+        argv.push(rows.to_string().into());
+    }
+    if !remote.shell.is_empty() {
+        // `run` would otherwise read the shell's own arguments as its own.
+        argv.push("--".into());
+        argv.extend(remote.shell.iter().map(OsString::from));
+    }
+    Ok(argv)
+}
+
+/// The shell and directory the machine's owner recorded when they turned this on.
+///
+/// Not the daemon's inherited working directory, which is `/`, and not the one it was
+/// started from: the daemon belongs to whichever `run` happened to be first, and
+/// neither is what somebody means by "open me a shell".
+fn apply_owner_environment(
+    remote: &crate::state::RemoteOpenConfig,
+    command: &mut std::process::Command,
+) {
+    if !remote.cwd.is_empty() {
+        command.current_dir(&remote.cwd);
     } else if let Ok(home) = std::env::var("HOME") {
         command.current_dir(home);
     }
-    if let Some(program) = shared.remote.shell.first() {
+    if let Some(program) = remote.shell.first() {
         command.env("SHELL", program);
     }
-    command.arg("run");
-    command.arg("--label").arg(label);
-    command.arg("--in-reply-to").arg(request_id);
-    command.arg("--cols").arg(cols.to_string());
-    command.arg("--rows").arg(rows.to_string());
-    if shared.remote.shell.len() > 1 || !shared.remote.shell.is_empty() {
-        command.arg("--");
-        for argument in &shared.remote.shell {
-            command.arg(argument);
-        }
-    }
-    command.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Appends to a private log beside the daemon's own.
@@ -680,13 +904,19 @@ fn append_remote_open_log(log: &Path, line: &str) {
     }
 }
 
-fn detached_command(state_file: &Path, log: &Path) -> Result<std::process::Command, String> {
+fn this_program() -> Result<OsString, String> {
+    std::env::current_exe()
+        .map(std::path::PathBuf::into_os_string)
+        .map_err(|e| format!("finding this program: {e}"))
+}
+
+/// A command detached from this daemon: its own session, no stdio of the daemon's, and
+/// stderr in the daemon's log.
+fn detached_command(program: &OsStr, log: &Path) -> Result<std::process::Command, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::process::CommandExt as _;
 
-    let exe = std::env::current_exe().map_err(|e| format!("finding this program: {e}"))?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("--state-file").arg(state_file);
+    let mut command = std::process::Command::new(program);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     // Never the caller's stderr: `run` puts its terminal into raw mode, and a stray
@@ -1152,6 +1382,149 @@ mod tests {
         // Not ASCII-only: a name in somebody's own language is not an attack.
         assert!(acceptable_label("студия"));
         assert!(acceptable_label("ビルド"));
+    }
+
+    fn a_policy(shell: &[&str]) -> crate::state::RemoteOpenConfig {
+        crate::state::RemoteOpenConfig {
+            enabled: true,
+            shell: shell.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn argv_of(size: Option<(u16, u16)>) -> Vec<String> {
+        hosting_argv(
+            Path::new("/tmp/publisher.json"),
+            &a_policy(&["/bin/zsh", "-l"]),
+            "phone",
+            "req-1",
+            size,
+        )
+        .expect("builds")
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect()
+    }
+
+    #[test]
+    fn a_headless_terminal_is_opened_at_the_size_the_phone_asked_for() {
+        // Nothing on this machine renders it, so the subscriber's request is the only
+        // size there is; `run` would otherwise fall back to a tty it does not have.
+        let argv = argv_of(Some((100, 40)));
+        let cols = argv.iter().position(|a| a == "--cols").expect("--cols");
+        let rows = argv.iter().position(|a| a == "--rows").expect("--rows");
+        assert_eq!(argv[cols + 1], "100");
+        assert_eq!(argv[rows + 1], "40");
+    }
+
+    #[test]
+    fn a_windowed_terminal_is_not_given_the_phone_s_size() {
+        // Inside a window the window is the authority on its own size (spec §6.5) and
+        // `run` reads it from the tty it was handed. Passing the phone's request would
+        // pin the shell to a corner of the window until the first size check moved it.
+        let argv = argv_of(None);
+        assert!(!argv.iter().any(|a| a == "--cols" || a == "--rows"));
+    }
+
+    #[test]
+    fn the_hosted_shell_is_separated_from_run_s_own_arguments() {
+        let argv = argv_of(None);
+        let separator = argv.iter().position(|a| a == "--").expect("--");
+        assert_eq!(&argv[separator + 1..], ["/bin/zsh", "-l"]);
+    }
+
+    #[test]
+    fn refusing_a_window_refuses_it_whatever_this_machine_has() {
+        assert_eq!(window_command(&crate::state::WindowPolicy::Never), None);
+    }
+
+    #[test]
+    fn a_chosen_emulator_is_used_as_given_and_never_searched_for() {
+        // The owner named a command. Detection would quietly substitute another.
+        let chosen = vec!["konsole".to_string(), "-e".to_string()];
+        assert_eq!(
+            window_command(&crate::state::WindowPolicy::Command(chosen.clone())),
+            Some(chosen)
+        );
+    }
+
+    #[test]
+    fn an_empty_chosen_emulator_hosts_headlessly_rather_than_detecting_one() {
+        // "No command" is a broken setting, not a request to pick something; falling
+        // through to detection would open a window the owner did not ask for.
+        assert_eq!(
+            window_command(&crate::state::WindowPolicy::Command(Vec::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_label_that_could_split_a_command_line_costs_the_window_not_the_terminal() {
+        // Windows Terminal reads `;` as the separator between its own commands, and
+        // this label came off the network. The hosting argv is the same one an
+        // emulator is handed, so the check belongs on what goes into it.
+        let argv = hosting_argv(
+            Path::new("/tmp/publisher.json"),
+            &a_policy(&["/bin/bash"]),
+            "phone;new-tab",
+            "req-1",
+            None,
+        )
+        .expect("builds");
+        assert!(
+            argv.iter()
+                .any(|a| a.to_string_lossy().contains(NO_WINDOW_ARGUMENT)),
+            "the label reaches the emulator's argv, so the guard has something to catch"
+        );
+    }
+
+    #[test]
+    fn windows_terminal_asks_for_a_tab_in_a_window_of_its_own() {
+        // `new-tab` without `-w` opens a fresh window every time, and `-w 0` would put
+        // the phone's shell in whichever window this machine's owner last typed in.
+        let argv = windows_terminal_argv("/mnt/c/wt.exe", "Ubuntu-24.04");
+        let window = argv.iter().position(|a| a == "-w").expect("-w");
+        assert_eq!(argv[window + 1], WINDOWS_TERMINAL_WINDOW);
+        assert_eq!(argv[window + 2], "new-tab");
+        // The command still has to come back into this distribution, not Windows.
+        let distribution = argv.iter().position(|a| a == "-d").expect("-d");
+        assert_eq!(argv[distribution + 1], "Ubuntu-24.04");
+        assert_eq!(argv.last().map(String::as_str), Some("--"));
+    }
+
+    #[test]
+    fn an_emulator_with_tabs_asks_for_one() {
+        // A phone opening a second terminal should add to the window the first made.
+        // These three take the tab flag before the flag naming the command, so the
+        // order here is the part that breaks silently if it is ever swapped.
+        for (program, expected) in [
+            ("gnome-terminal", ["--tab", "--"]),
+            ("konsole", ["--new-tab", "-e"]),
+            ("xfce4-terminal", ["--tab", "-x"]),
+        ] {
+            let (_, flags) = WINDOW_TERMINALS
+                .iter()
+                .find(|(name, _)| *name == program)
+                .unwrap_or_else(|| panic!("{program} is no longer detected"));
+            assert_eq!(*flags, expected, "{program}");
+        }
+    }
+
+    #[test]
+    fn every_detectable_emulator_names_a_program_and_nothing_else() {
+        // The table's first element is spawned directly, so a flag or a shell string
+        // smuggled into that slot would be executed as the program.
+        for (program, _) in WINDOW_TERMINALS {
+            assert!(!program.is_empty());
+            assert!(
+                !program.starts_with('-'),
+                "{program} is a flag, not a program"
+            );
+            assert!(
+                !program.contains(['/', ' ', ';', '&', '|']),
+                "{program} must be a bare name looked up on PATH"
+            );
+        }
     }
 
     #[test]

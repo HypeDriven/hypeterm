@@ -49,6 +49,25 @@ fn default_max_remote_terminals() -> u32 {
     4
 }
 
+/// Whether a phone-opened terminal also gets a window on this machine's own screen.
+///
+/// A mirror is two places watching one shell, so a shell that exists only inside the
+/// daemon is half of one: the phone can see it and the person sitting here cannot.
+/// `Auto` opens a window when this machine has a display and a terminal emulator to
+/// open it with, and hosts headlessly when it has neither — which is every server, and
+/// is what this did before a window was possible.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowPolicy {
+    #[default]
+    Auto,
+    Never,
+    /// An emulator argv chosen here rather than detected. The command that hosts the
+    /// shell is appended to it, so it ends with whatever that emulator's "and then run
+    /// this" flag is — `["konsole", "-e"]`, `["gnome-terminal", "--"]`.
+    Command(Vec<String>),
+}
+
 /// The machine owner's own policy for phone-initiated terminals.
 ///
 /// Captured explicitly rather than inherited: the daemon's environment is whichever
@@ -67,6 +86,9 @@ pub struct RemoteOpenConfig {
     pub cwd: String,
     #[serde(default = "default_max_remote_terminals")]
     pub max_terminals: u32,
+    /// Whether terminals opened this way also appear on this machine's screen.
+    #[serde(default)]
+    pub window: WindowPolicy,
 }
 
 impl Default for RemoteOpenConfig {
@@ -76,6 +98,7 @@ impl Default for RemoteOpenConfig {
             shell: Vec::new(),
             cwd: String::new(),
             max_terminals: default_max_remote_terminals(),
+            window: WindowPolicy::default(),
         }
     }
 }
@@ -254,6 +277,7 @@ mod tests {
         assert!(!stored.remote_open.enabled);
         assert!(stored.remote_open.shell.is_empty());
         assert_eq!(stored.remote_open.max_terminals, 4);
+        assert_eq!(stored.remote_open.window, WindowPolicy::Auto);
     }
 
     #[test]
@@ -272,6 +296,37 @@ mod tests {
         assert_eq!(read.remote_open.shell, vec!["/bin/zsh", "-l"]);
         assert_eq!(read.remote_open.cwd, "/home/someone");
         assert_eq!(read.remote_open.max_terminals, 2);
+    }
+
+    #[test]
+    fn an_explicit_window_command_survives_a_round_trip() {
+        // The keyword policies and an argv share one field, so the one that is not a
+        // bare string is the one worth asserting: it is the shape serde could flatten.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("publisher.json");
+        let mut stored = State::default();
+        stored.remote_open.window = WindowPolicy::Command(vec!["konsole".into(), "-e".into()]);
+        save(&path, &stored).unwrap();
+
+        let read = load(&path).expect("loads");
+        assert_eq!(
+            read.remote_open.window,
+            WindowPolicy::Command(vec!["konsole".into(), "-e".into()])
+        );
+    }
+
+    #[test]
+    fn refusing_a_window_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("publisher.json");
+        let mut stored = State::default();
+        stored.remote_open.window = WindowPolicy::Never;
+        save(&path, &stored).unwrap();
+
+        assert_eq!(
+            load(&path).expect("loads").remote_open.window,
+            WindowPolicy::Never
+        );
     }
 
     #[cfg(unix)]

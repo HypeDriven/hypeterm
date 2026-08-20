@@ -114,6 +114,48 @@ On **Windows** there is no daemon: `run` publishes directly, one terminal at a t
 a second one supersedes the first. A shell inside WSL runs the Linux build and mirrors
 as many as you like, which is the better arrangement there anyway (see below).
 
+### Terminals a phone opens
+
+A paired phone can ask this machine for a terminal, but only once somebody sitting here
+has said so — the relay may ask whatever it likes, and nothing spawns without this:
+
+```bash
+hypeterm-publish remote-open --enable --shell /bin/bash --max 4
+hypeterm-publish remote-open --status     # the policy, and what it resolves to here
+hypeterm-publish remote-open --disable
+```
+
+The machine alone decides what runs: the request carries a label and a size and no
+command, working directory or environment (relay spec §4.6). Those come from what was
+recorded above.
+
+Such a terminal also opens **on this machine's screen**, so the same shell is in front
+of whoever is sitting here and on the phone — which is what a mirror means. A second one
+opens as a **tab** beside the first wherever the emulator has tabs, rather than another
+window; under WSL they share a Windows Terminal window named `hypeterm`, which keeps
+them out of the window you are working in. `--window` chooses the emulator:
+
+| `--window` | |
+| --- | --- |
+| `auto` (default) | Windows Terminal under WSL; otherwise `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `wezterm`, `alacritty`, `kitty`, `foot` or `xterm`, whichever is on `PATH` |
+| `never` | always host it headlessly |
+| a command | the emulator to use, ending with its "and then run this" flag: `--window konsole -e`. Tabs are then yours to ask for — `--window wt.exe -w new wsl.exe -d Ubuntu-24.04 --` gets a window each |
+
+A window is only tried where one could appear — under WSL, or with `DISPLAY` /
+`WAYLAND_DISPLAY` set — so a server hosts headlessly without being told to. If the
+emulator fails anyway (no display, a missing font) the shell is hosted headlessly
+instead: the phone asked for a terminal, and one without a window here is still the
+terminal it asked for. The daemon's `remote-opens.log` records what happened.
+
+Two consequences of the window being real. Its size is the terminal's size, not the
+size the phone asked for, because the publisher is the sole authority over the
+dimensions (relay spec §6.5) and the phone renders whatever grid it is sent. And closing
+a tab ends that shell, exactly as closing any terminal does.
+
+Labels carrying a `;` get no window. Windows Terminal reads one as the separator
+between its own commands, so an argument holding one would arrive split in two — and
+that label came off the network. It is refused rather than escaped.
+
 ### Windows Terminal
 
 Add one profile. Settings → *Open JSON file*, then add to `profiles.list`:

@@ -119,6 +119,17 @@ remote-open --enable` is the switch that matters: the relay may say whatever it 
 nothing spawns locally without it. A phone that can both open terminals and type into
 them can run anything the user can.
 
+**One of those terminals opens in a window here too, when this machine has one to open.**
+A shell that exists only inside the daemon is half a mirror — visible on the phone,
+invisible to the person sitting at the machine that is running it. The second one asks
+for a tab beside the first rather than a window of its own, in a window named for this
+tool so a phone never opens a shell in the one somebody here is typing in. `--window never`, and
+every machine without a display, keeps the headless behaviour. Two things follow from the
+window being real: it, not the phone's request, is the terminal's size (relay spec §6.5),
+and the argv handed to an emulator is checked for `;` first, because Windows Terminal
+reads one as the separator between its own commands and the label in that argv came off
+the network.
+
 **The client never resizes the remote terminal.** The phone renders at the publisher's
 grid size and zooms and pans over it (client spec §10.4). Reshaping a session someone is
 working in is not the phone's decision.

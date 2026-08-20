@@ -92,16 +92,8 @@ enum Command {
         /// Show the current policy.
         #[arg(long, conflicts_with_all = ["enable", "disable"])]
         status: bool,
-        /// Program to host, defaulting to $SHELL. Taken as argv, never as a shell
-        /// string: nothing on this path is passed to `sh -c`.
-        #[arg(long, num_args = 1.., requires = "enable")]
-        shell: Option<Vec<String>>,
-        /// Working directory for terminals opened this way. Defaults to $HOME.
-        #[arg(long, requires = "enable")]
-        cwd: Option<String>,
-        /// How many terminals a phone may have open here at once.
-        #[arg(long, requires = "enable")]
-        max: Option<u32>,
+        #[command(flatten)]
+        settings: RemoteOpenSettings,
     },
     /// Run the process that mirrors every terminal on this machine.
     ///
@@ -126,6 +118,28 @@ enum Command {
     List,
     /// Show what this machine has enrolled.
     Status,
+}
+
+/// What `remote-open --enable` records. One value rather than four loose arguments,
+/// because every one of them is only meaningful alongside the others.
+#[derive(clap::Args, Debug)]
+struct RemoteOpenSettings {
+    /// Program to host, defaulting to $SHELL. Taken as argv, never as a shell
+    /// string: nothing on this path is passed to `sh -c`.
+    #[arg(long, num_args = 1.., requires = "enable")]
+    shell: Option<Vec<String>>,
+    /// Working directory for terminals opened this way. Defaults to $HOME.
+    #[arg(long, requires = "enable")]
+    cwd: Option<String>,
+    /// How many terminals a phone may have open here at once.
+    #[arg(long, requires = "enable")]
+    max: Option<u32>,
+    /// Whether a terminal opened this way also gets a window on this machine's own
+    /// screen: `auto` to open one when this machine has a display and an emulator to
+    /// open it with, `never` to always host headlessly, or the emulator command to
+    /// use, which the hosting command is appended to — `--window konsole -e`.
+    #[arg(long, num_args = 1.., requires = "enable", value_name = "auto|never|COMMAND")]
+    window: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -164,10 +178,8 @@ async fn main() {
             enable,
             disable,
             status,
-            shell,
-            cwd,
-            max,
-        } => remote_open(&path, enable, disable, status, shell, cwd, max),
+            settings,
+        } => remote_open(&path, enable, disable, status, settings),
         Command::List => list_terminals(&path).await,
         Command::Status => status(&path),
     };
@@ -752,6 +764,7 @@ async fn daemon_command(
         shell: stored.remote_open.shell.clone(),
         cwd: stored.remote_open.cwd.clone(),
         max_terminals: stored.remote_open.max_terminals,
+        window: stored.remote_open.window.clone(),
     };
     hypeterm_publish::daemon::serve(
         paths,
@@ -890,9 +903,7 @@ fn remote_open(
     enable: bool,
     disable: bool,
     show: bool,
-    shell: Option<Vec<String>>,
-    cwd: Option<String>,
-    max: Option<u32>,
+    settings: RemoteOpenSettings,
 ) -> Result<(), String> {
     let mut stored = load(path)?;
 
@@ -905,6 +916,12 @@ fn remote_open(
     }
 
     if enable {
+        let RemoteOpenSettings {
+            shell,
+            cwd,
+            max,
+            window,
+        } = settings;
         let argv = match shell {
             Some(argv) if !argv.is_empty() => argv,
             _ => vec![std::env::var("SHELL").map_err(|_| {
@@ -921,6 +938,9 @@ fn remote_open(
         if let Some(max) = max {
             stored.remote_open.max_terminals = max.max(1);
         }
+        if let Some(spec) = window {
+            stored.remote_open.window = window_policy(spec)?;
+        }
         state::save(path, &stored).map_err(|e| e.to_string())?;
 
         println!("remote open: on");
@@ -934,6 +954,10 @@ fn remote_open(
             }
         );
         println!("  at most   {} terminals", stored.remote_open.max_terminals);
+        println!(
+            "  window    {}",
+            describe_window(&stored.remote_open.window)
+        );
         println!();
         // Said plainly, once, at the moment of consent. Somebody turning this on should
         // not have to infer what it means from a spec section.
@@ -964,10 +988,49 @@ fn remote_open(
             }
         );
         println!("  at most   {} terminals", stored.remote_open.max_terminals);
+        println!(
+            "  window    {}",
+            describe_window(&stored.remote_open.window)
+        );
     } else {
         println!("enable with: hypeterm-publish remote-open --enable");
     }
     Ok(())
+}
+
+/// `auto`, `never`, or an emulator argv.
+fn window_policy(spec: Vec<String>) -> Result<state::WindowPolicy, String> {
+    if spec.is_empty() {
+        return Err("--window takes auto, never, or a terminal command".into());
+    }
+    if spec.len() == 1 {
+        match spec[0].as_str() {
+            "auto" => return Ok(state::WindowPolicy::Auto),
+            "never" => return Ok(state::WindowPolicy::Never),
+            _ => {}
+        }
+    }
+    Ok(state::WindowPolicy::Command(spec))
+}
+
+/// Says what the policy will actually do, not just what it is called.
+///
+/// `auto` on its own leaves somebody guessing whether a window will appear, which is
+/// the question this setting exists to answer. The detection runs here rather than in
+/// the daemon, so it reports this session's display — near enough to be useful, and
+/// worth re-reading after `daemon --stop` if the two ever disagree.
+fn describe_window(policy: &state::WindowPolicy) -> String {
+    match policy {
+        state::WindowPolicy::Never => "never — hosted headlessly".into(),
+        state::WindowPolicy::Command(argv) => argv.join(" "),
+        #[cfg(unix)]
+        state::WindowPolicy::Auto => match hypeterm_publish::daemon::window_command(policy) {
+            Some(argv) => format!("auto — {}", argv.join(" ")),
+            None => "auto — no display or no terminal emulator here, so headless".into(),
+        },
+        #[cfg(not(unix))]
+        state::WindowPolicy::Auto => "auto".into(),
+    }
 }
 
 fn status(path: &std::path::Path) -> Result<(), String> {
